@@ -1,0 +1,8 @@
+{
+  "_note": "持仓配置文件 — rule_engine.py 自动读取。不在这个文件里的股票，不值得跑L5。",
+  "_updated": "2026-07-18",
+  "holdings": {
+    "688008": {"cost": 254.04, "position_pct": 20, "type": "大黑马", "name": "澜起科技"},
+    "688981": {"cost": 89.50, "position_pct": 10, "type": "周期反转", "name": "中芯国际"}
+  }
+}

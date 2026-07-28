@@ -1,0 +1,247 @@
+{
+  "_meta": {
+    "framework": "产业周期三重确认 + 泡沫破裂风控",
+    "version": "1.0",
+    "source": "产业周期三重确认与泡沫破裂风控研究.pdf (44页, 2026-07)",
+    "date": "2026-07-24",
+    "historical_validation": {
+      "formal_samples": 11,
+      "effective_mitigation": "11/11",
+      "median_drawdown": -49.2,
+      "median_avoidance_pct": 80.4,
+      "expansion_samples": 1,
+      "ongoing_samples": 3
+    }
+  },
+
+  "rule_01_triple_gate": {
+    "description": "三道门都打开，才进入顶部警戒。不是顶部预测器，是'本轮产业上行已足够完整'的确认。",
+    "gates": {
+      "price_rally": {
+        "indicator": "行业等权价格指数",
+        "condition": "较过去756个交易日最低点涨幅 >= 100%",
+        "data_source": "行业成分股日线收盘价, 等权计算, 至少5只成分股",
+        "note": "上市不足120日/ST/无效回报的股票排除"
+      },
+      "earnings_surge": {
+        "indicator": "单季财报",
+        "condition": "最新可得单季营收同比 >= 20% AND 归母净利润同比 >= 30%",
+        "data_source": "季报/年报, 按实际可得日生效(一季报/年报=4/30, 半年报=8/31, 三季报=10/31)",
+        "expiry": "单季高增长信号最多沿用190个自然日, 新财报不满足立即失效",
+        "note": "只让基本面确认繁荣已发生, 风险变化交给价格趋势(Rule 02)"
+      },
+      "cycle_overheat": {
+        "indicator": "库存得分 + 产能得分",
+        "condition": "库存得分 > 行业自身此前24个有效财政季度75分位 AND 产能得分 > 行业自身此前24个有效财政季度75分位",
+        "condition_note": "阈值 = max(该分位数值, 0). 至少需要4个此前有效季度.",
+        "inventory_score": {
+          "formula": "(存货同比Z - 合同负债同比Z + 购买商品现金支出同比Z) / 3",
+          "data_fields": ["存货", "合同负债", "购买商品/接受劳务支付的现金"]
+        },
+        "capacity_score": {
+          "formula": "(资本性支出同比Z + 在建工程同比Z - 资产周转率Z) / 3",
+          "data_fields": ["资本性支出", "在建工程", "资产周转率(收入/总资产)"]
+        },
+        "z_score_method": "每指标使用过去24个季度的滚动均值和样本标准差标准化",
+        "expiry": "双高线索最多沿用4个财政报告期",
+        "note": "为什么不用GPM/ROE: 基本面最好的季度往往在价格顶部附近, 滞后于价格"
+      }
+    },
+    "trigger": "ALL three gates pass simultaneously",
+    "output": "警戒日 (alert_date)"
+  },
+
+  "rule_02_trend_control": {
+    "description": "警戒后的趋势风控。20日线管战术, 200日线管战略。",
+    "states": {
+      "FOLLOW": {
+        "name": "跟随行业基准",
+        "condition": "三重确认前 OR (三重确认后 且 价格在20日线上方)",
+        "action": "完全承担行业价格波动"
+      },
+      "PAUSE": {
+        "name": "暂停价格暴露",
+        "condition": "三重确认后 AND 前一日收盘 < 20日均线",
+        "action": "下一交易日停止跟随, 不承担行业波动",
+        "reversible": true,
+        "trigger": "站回20日线 → 恢复FOLLOW"
+      },
+      "STOP": {
+        "name": "永久停止恢复",
+        "condition": "连续3个交易日收盘 < 200日均线",
+        "action": "本轮停止恢复价格暴露, 直到下一价格低点",
+        "reversible": false,
+        "note": "200日线确认后, 不再因短期站回而改变状态"
+      }
+    },
+    "cost_assumptions": {
+      "resume_cost_pct": 0.08,
+      "pause_cost_pct": 0.13
+    },
+    "key_insight": "20日线负责快速调整(会反复暂停/恢复), 200日线负责确认长期趋势变化(一次性的). 历史价值主要来自这个先快后慢的组合."
+  },
+
+  "evaluation_formula": {
+    "avoidance_pct": {
+      "formula": "(规则路径峰谷回报 - 行业基准路径峰谷回报) / |行业基准峰谷跌幅| × 100",
+      "interpretation": "100% = 规则完全避开下跌; 50% = 少承受一半; 0% = 无效; 负值 = 更差"
+    },
+    "effective_standard": "规避比例 >= 50% (至少规避一半严重跌幅)"
+  },
+
+  "current_tech_cycle": {
+    "observation_date": "2026-07-15",
+    "industries": {
+      "electronic_components": {
+        "name_cn": "电子元件",
+        "cycle_start": "2024-02-05",
+        "alert_date": "2025-09-02",
+        "alert_gates": {
+          "price_rally": {"status": "PASS", "value": "+187.7%", "threshold": ">=100%"},
+          "earnings_surge": {"status": "PASS", "value": "营收+24.4% / 净利+46.7%", "threshold": "营收>=20% AND 净利>=30%"},
+          "cycle_overheat": {
+            "status": "PASS",
+            "inventory_score": "+0.56",
+            "inventory_75pct": "+0.19",
+            "capacity_score": "+0.47",
+            "capacity_75pct": "+0.20"
+          }
+        },
+        "rule_02_state": {
+          "current": "PAUSE",
+          "below_20ma": true,
+          "below_200ma": false,
+          "t200_confirmed": false,
+          "t20_pause_count": 12,
+          "t20_resume_count": 11,
+          "phase_drawdown": -19.8,
+          "avoidance_so_far": 62.7
+        },
+        "status_summary": "已警戒, 20日线下暂停中, 200日线未确认 → 战术暂停, 仍可恢复"
+      },
+      "consumer_electronics": {
+        "name_cn": "消费电子",
+        "cycle_start": "2024-02-07",
+        "alert_date": "2025-11-03",
+        "alert_gates": {
+          "price_rally": {"status": "PASS", "value": "+?%", "threshold": ">=100%"},
+          "earnings_surge": {"status": "PASS", "value": "营收>=20% / 净利>=30%", "threshold": "营收>=20% AND 净利>=30%"},
+          "cycle_overheat": {"status": "PASS", "inventory_score": ">75分位", "capacity_score": ">75分位"}
+        },
+        "rule_02_state": {
+          "current": "PAUSE",
+          "below_20ma": true,
+          "below_200ma": false,
+          "t200_confirmed": false,
+          "t20_pause_count": 7,
+          "t20_resume_count": 6,
+          "phase_drawdown": -15.9,
+          "avoidance_so_far": 29.2
+        },
+        "status_summary": "已警戒, 20日线下暂停中, 200日线未确认"
+      },
+      "communication_equipment": {
+        "name_cn": "通信设备",
+        "cycle_start": "2024-02-05",
+        "alert_date": "2026-05-06",
+        "alert_gates": {
+          "price_rally": {"status": "PASS", "value": "+?%", "threshold": ">=100%"},
+          "earnings_surge": {"status": "PASS", "value": "营收>=20% / 净利>=30%", "threshold": "营收>=20% AND 净利>=30%"},
+          "cycle_overheat": {"status": "PASS", "inventory_score": ">75分位", "capacity_score": ">75分位"}
+        },
+        "rule_02_state": {
+          "current": "PAUSE",
+          "below_20ma": true,
+          "below_200ma": false,
+          "t200_confirmed": false,
+          "t20_pause_count": 2,
+          "t20_resume_count": 1,
+          "phase_drawdown": -19.3,
+          "avoidance_so_far": 19.2
+        },
+        "status_summary": "最新警戒(2026-05), 20日线下暂停中, 200日线未确认"
+      }
+    },
+    "aggregate_status": "三个科技赛道全部已警戒, 全部未完成200日线长期趋势确认. 规则当前状态: 暂停价格暴露(可逆). 不等于'顶部已现'."
+  },
+
+  "data_requirements": {
+    "per_industry": {
+      "price": [
+        "行业成分股日线收盘价(至少5只)",
+        "等权价格指数(日频)",
+        "20日均线",
+        "200日均线"
+      ],
+      "earnings": [
+        "单季营业收入(每季)",
+        "单季归母净利润(每季)",
+        "财报可得日(4/30, 8/31, 10/31)"
+      ],
+      "inventory_capacity": [
+        "存货(每季)",
+        "合同负债(每季)",
+        "购买商品/接受劳务支付的现金(每季)",
+        "资本性支出(每季)",
+        "在建工程(每季)",
+        "资产周转率 = 收入/总资产(每季)"
+      ]
+    },
+    "already_available": {
+      "from_data_bridge": ["个股日线K线(500根)", "个股MA20/MA200", "个股财务指标(GPM/ROE/负债等)"],
+      "missing_for_industry_cycle": [
+        "行业等权价格指数(需构建: 成分股筛选+等权)",
+        "6个产能库存季度指标(存货/合同负债/CAPEX等同比Z-score)",
+        "行业自身75分位阈值(需24季滚动窗口)",
+        "成分股归属(SW3分类, 当前bridge有)"
+      ]
+    }
+  },
+
+  "state_machine": {
+    "description": "Rule 02状态机, 可编程化",
+    "initial_state": "FOLLOW",
+    "transitions": [
+      {
+        "from": "FOLLOW",
+        "to": "PAUSE",
+        "trigger": "alert_active == true AND close_yesterday < MA20"
+      },
+      {
+        "from": "PAUSE",
+        "to": "FOLLOW",
+        "trigger": "alert_active == true AND close_yesterday > MA20 AND t200_confirmed == false"
+      },
+      {
+        "from": "PAUSE",
+        "to": "STOP",
+        "trigger": "consecutive_days_below_200ma >= 3"
+      },
+      {
+        "from": "STOP",
+        "to": "FOLLOW",
+        "trigger": "new_cycle_low_detected (下一轮周期重新开始)"
+      }
+    ],
+    "required_daily_signals": [
+      "alert_active: bool (Rule 01 triple gate)",
+      "close_yesterday: float",
+      "ma20: float",
+      "ma200: float",
+      "consecutive_days_below_200ma: int",
+      "t200_confirmed: bool"
+    ]
+  },
+
+  "integration_with_existing_l3": {
+    "current_l3_method": "SW3 Z-score + BK黑名单 + 定性判断",
+    "new_method_positioning": "L3补丁: 当Z-score方法判定'保留/中性'但三重确认已触发时, Rule 02接管",
+    "workflow": [
+      "1. 用现有L3 Z-score做日常产业周期择时",
+      "2. 同时跑Rule 01三重确认, 监控是否存在'三灯全亮'的行业",
+      "3. 三重确认触发后, Rule 02 20/200日线接管仓位暴露决策",
+      "4. 200日线确认前: 战术暂停(可反复); 200日线确认后: 永久停止"
+    ],
+    "immediate_implication": "当前你关注的所有半导体/电子个股, 其所属行业(电子元件/消费电子/通信设备)都已进入警戒状态. 个股层面的MA20破位(L5弱B/强B) + 行业层面的三重确认警戒 → 双重风控信号."
+  }
+}
