@@ -23,6 +23,7 @@ FETCH_REPORT = os.path.join(FINANCE_DIR, "fetch_report.py")
 HERMES_FIN   = os.path.join(FINANCE_DIR, "hermes_finance.py")
 WW_SCRIPT    = os.path.join(SCRIPTS_DIR, "ww_indicator.py")
 SP500_SCRIPT = os.path.join(SCRIPTS_DIR, "compute_sp500_score.py")
+STEP_M_SCRIPT  = os.path.join(FINANCE_DIR, "step_m.py")
 
 # CSV paths — try multiple locations
 CSV_PATHS = [
@@ -44,10 +45,10 @@ def safe_float(val):
     except: return None
 
 
-def run_script(cmd, timeout=120):
+def run_script(cmd, timeout=120, encoding='gbk'):
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                           timeout=timeout, cwd=FINANCE_DIR, encoding='gbk', errors='replace')
+                           timeout=timeout, cwd=FINANCE_DIR, encoding=encoding, errors='replace')
         return r.stdout, r.stderr, r.returncode
     except subprocess.TimeoutExpired:
         return None, "TIMEOUT", -1
@@ -214,6 +215,51 @@ def step_b_sp500():
         result["intervention"] = True
         cap = "35%" if result["l1_level"]=="L4" else "15%"
         result["intervention_detail"] = f"L1={result['l1_level']} -> 仓位 <= {cap}"
+    return result
+
+
+# ═══════════════════════════════════════
+# Step M: L2.5 市场水温 (step_m.py)
+# ═══════════════════════════════════════
+def step_m_market_temp(waw_result):
+    result = {
+        "executed": False, "snapshot_time": "", "frequency": "daily_close",
+        "summary": "", "breadth": {}, "flow": {}, "sentiment": {},
+        "volume": {}, "rotation": {}, "synthesis": {}, "waw_overlap": {},
+        "error": None
+    }
+
+    # 构建 --waw_score 参数 (从 step_a 注入 W&W 分位)
+    waw_score_val = waw_result.get("ww")
+    if isinstance(waw_score_val, (int, float)):
+        waw_json = json.dumps({
+            "score": waw_score_val,
+            "zone": waw_result.get("zone", "未知"),
+            "margin_percentile": str(waw_result.get("six_factors", {}).get("融资余额", "未知")),
+            "volume_percentile": str(waw_result.get("six_factors", {}).get("成交量", "未知"))
+        }, ensure_ascii=False)
+    else:
+        waw_json = "{}"
+
+    stdout, stderr, rc = run_script(
+        f'python "{STEP_M_SCRIPT}" --waw_score \'{waw_json}\'',
+        timeout=180, encoding='utf-8'
+    )
+
+    if rc != 0:
+        result["error"] = f"step_m.py 返回码 {rc}: {stderr[:200] if stderr else '未知'}"
+        return result
+
+    data = parse_json_from_output(stdout)
+    if data is None:
+        result["error"] = f"无法解析 step_m.py JSON: {stdout[:300] if stdout else '无输出'}"
+        return result
+
+    result["executed"] = True
+    sm = data.get("step_m", {})
+    for key in result:
+        if key in sm and key not in ("executed", "error"):
+            result[key] = sm[key]
     return result
 
 
@@ -651,36 +697,184 @@ def step_f_quarterly(code):
 
 
 # ═══════════════════════════════════════
+# Step G: Bull vs Bear 对抗辩论
+# ═══════════════════════════════════════
+BULL_SYSTEM = """你是一位**多方分析师**，任务是找到这只股票所有值得买入的理由。
+
+规则:
+1. 基于提供的数据，找到最强的3-5个看多论点
+2. 每个论点必须引用具体数据（数字、趋势、比率）
+3. 不要假装客观——你是多头，你的本职工作就是找买入理由
+4. 如果有对方（空方）说过的话，针对性反驳
+5. A股特有的多看：政策顺风、北向资金、产业趋势、国产替代"""
+
+BEAR_SYSTEM = """你是一位**空方分析师**，任务是找到这只股票所有应该卖出的理由。
+
+规则:
+1. 基于提供的数据，找到最强的3-5个看空论点
+2. 每个论点必须引用具体数据（数字、趋势、比率）
+3. 不要假装客观——你是空头，你的本职工作就是找做空理由
+4. 必须针对性攻击多方刚说的每一个核心论点
+5. A股特有的多看：政策逆风、解禁减持、游资撤退、估值泡沫、T+1陷阱"""
+
+JUDGE_SYSTEM = """你是**研究经理**。刚才多方和空方进行了辩论，现在请你做总结。
+
+输出三个部分:
+
+### 共识
+多方和空方都同意的点是什么？
+
+### 核心分歧
+最关键的争执是什么？双方各用什么数据支撑？
+
+### 证据强度
+谁的论点更有说服力？为什么？如果数据有缺陷，指出来。"""
+
+
+def step_g_debate(bridge):
+    """Bull vs Bear 对抗辩论。需要 DEEPSEEK_API_KEY 环境变量。"""
+    result = {
+        "executed": False, "rounds": 1, "bull_args": [], "bear_args": [],
+        "summary": "", "error": None
+    }
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+    if not api_key:
+        result["error"] = "DEEPSEEK_API_KEY 未设置, 跳过辩论"
+        return result
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        result["error"] = "openai 未安装, 跳过辩论"
+        return result
+
+    # 构建辩论上下文
+    meta = bridge.get("_meta", {})
+    daily = bridge.get("preflight", {}).get("step_c", {}).get("daily", {})
+    monthly = bridge.get("preflight", {}).get("step_c", {}).get("monthly", {})
+    fin = bridge.get("preflight", {}).get("step_c", {}).get("financials", {})
+    step_d = bridge.get("preflight", {}).get("step_d", {})
+    quarters = bridge.get("quarterly", {}).get("quarters", [])
+    step_a = bridge.get("preflight", {}).get("step_a", {})
+
+    # 计算TTM ROE (修正坑3: bridge ROE是Q1单季年化, 辩论需要TTM值)
+    roe_q1 = fin.get('ROE')  # Q1单季年化
+    roe_ttm = None
+    equity = fin.get('equity')
+    if quarters and len(quarters) >= 4 and equity:
+        ttm_np = sum(q.get('net_profit', 0) or 0 for q in quarters[-4:])
+        if ttm_np and equity > 0:
+            roe_ttm = round(ttm_np / equity * 100, 1)
+    roe_display = f"Q1单季年化={roe_q1}%, TTM={roe_ttm}%" if roe_ttm else f"{roe_q1}%(Q1单季年化, 不代表全年)"
+
+    ctx = f"""股票: {meta.get('stock_name','')} ({meta.get('code','')})
+行业: {meta.get('SW1','')} / {meta.get('SW2','')} / {meta.get('SW3','')}
+L3判定: {step_d.get('L3_判定','')} — {step_d.get('L3_来源','')}
+
+【技术面】
+收盘: {daily.get('close')} | MA20: {daily.get('MA20')} | MA60: {daily.get('MA60')} | MA200: {daily.get('MA200')}
+MA20斜率: {daily.get('MA20_slope_pct')}% | 偏离MA20: {daily.get('deviation_from_MA20_pct')}%
+ATR: {daily.get('ATR14')} ({daily.get('ATR_pct')}%)
+5日/20日涨跌: {daily.get('chg_5d_pct')}% / {daily.get('chg_20d_pct')}%
+量比: {daily.get('volume_ratio_20d')} | 排列: {daily.get('alignment')}
+月线ATH: {monthly.get('ATH')} | 距ATH: {monthly.get('distance_from_ATH_pct')}%
+
+【财务】
+GPM: {fin.get('GPM')}% | ROE: {roe_display}
+有息负债/权益: {fin.get('debt_to_equity_pct')}%
+CFO/NP: {fin.get('cfo_to_np')} | NonRec%: {fin.get('nonrec_pct')}%
+商誉: {fin.get('goodwill_to_equity_pct')}%
+大股东质押: {fin.get('pledge_ratio_pct','未知')}% | 审计: {fin.get('audit_opinion','需核实')}
+
+【8季趋势】"""
+    for q in quarters[-8:]:
+        ctx += f"\n  {q.get('q','?')}: 营收{q.get('revenue','?')}亿 净利{q.get('net_profit','?')}亿 GPM{q.get('gpm','?')}%"
+    ctx += f"\n\n【宏观】W&W: {step_a.get('ww','?')} ({step_a.get('zone','?')})"
+
+    try:
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+        model = "deepseek-v4-pro"
+        result["executed"] = True
+
+        # Round 1: Bull
+        bull_resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": BULL_SYSTEM},
+                {"role": "user", "content": f"请分析这只股票的看多理由:\n\n{ctx}"}
+            ],
+            temperature=0.5
+        )
+        bull_arg = bull_resp.choices[0].message.content
+        result["bull_args"].append(bull_arg)
+
+        # Round 1: Bear (refuting Bull)
+        bear_resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": BEAR_SYSTEM},
+                {"role": "user", "content": f"多方刚说了:\n{bull_arg}\n\n请逐一反驳每个核心论点。\n\n数据:\n{ctx}"}
+            ],
+            temperature=0.5
+        )
+        bear_arg = bear_resp.choices[0].message.content
+        result["bear_args"].append(bear_arg)
+
+        # Judge
+        judge_resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM},
+                {"role": "user", "content": f"以下是多方和空方的辩论。请做总结:\n\n## 多方:\n{bull_arg}\n\n## 空方:\n{bear_arg}"}
+            ],
+            temperature=0.3
+        )
+        result["summary"] = judge_resp.choices[0].message.content
+
+    except Exception as e:
+        result["error"] = str(e)[:200]
+
+    return result
+
+
+# ═══════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════
 def build_bridge(code, quick=False):
     code_6 = code.strip().replace(".SZ","").replace(".SH","").replace(".BJ","").zfill(6)
 
     preflight = {
-        "step_a": {}, "step_b": {}, "step_c": {}, "step_d": {},
+        "step_a": {}, "step_b": {}, "step_m": {}, "step_c": {}, "step_d": {},
         "step_e": {
             "quadrant": "供给冲击型滞胀", "ceiling_pct": 50,
             "avoid_direction": "成本敏感型中游制造业",
             "ppi_ppirm_gap": -1.9, "data_source": "公开数据近似"
-        }
+        },
+        "step_g": {}
     }
 
     bridge = {
         "_meta": {
-            "bridge_version": "1.0", "code": code_6, "date": TODAY,
+            "bridge_version": "1.1", "code": code_6, "date": TODAY,
             "generated_by": "data_bridge.py - Claude Code",
-            "usage": "Hermes: 读取此 JSON, 填入 a-share-trading SKILL 模板。数据已解析, 直接用。"
+            "usage": "Hermes: 读取此 JSON, 填入 a-share-trading SKILL 模板。step_g为多方空方对抗辩论。"
         },
         "preflight": preflight,
         "quarterly": {}
     }
 
-    print(f"[1/5] W&W ...")
+    print(f"[1/7] W&W ...")
     preflight["step_a"] = step_a_ww()
     print(f"      W&W = {preflight['step_a'].get('ww')}  |  {preflight['step_a'].get('zone')}")
 
+    print(f"[2/7] 市场水温 (step_m.py) ...")
+    preflight["step_m"] = step_m_market_temp(preflight["step_a"])
+    sm = preflight["step_m"]
+    print(f"      水温: {sm.get('summary', '未知')}  |  {sm.get('synthesis', {}).get('consensus', '?')}")
+
     if not quick:
-        print(f"[2/5] SP500 ...")
+        print(f"[3/7] SP500 ...")
         preflight["step_b"] = step_b_sp500()
         print(f"      L1 = {preflight['step_b'].get('l1_level')}  |  SP500 = {preflight['step_b'].get('sp500')}")
     else:
@@ -692,14 +886,14 @@ def build_bridge(code, quick=False):
             "error": "[--quick] 跳过SP500脚本"
         }
 
-    print(f"[3/5] K线+财务 (fetch_report.py {code_6}) ...")
+    print(f"[4/7] K线+财务 (fetch_report.py {code_6}) ...")
     preflight["step_c"] = step_c_fetch_report(code_6)
     daily = preflight["step_c"].get("daily", {})
     fin = preflight["step_c"].get("financials", {})
     print(f"      日线: close={daily.get('close')} MA20={daily.get('MA20')} trend={daily.get('trend')}")
     print(f"      财务: GPM={fin.get('GPM')}%  ROE={fin.get('ROE')}%  debt/eq={fin.get('debt_to_equity_pct')}%")
 
-    print(f"[4/5] CSV分类 ...")
+    print(f"[5/7] CSV分类 ...")
     preflight["step_d"] = step_d_csv(code_6)
     # 回填 stock_name + SW2/SW3 到 _meta 供 Hermes 直读
     bridge["_meta"]["stock_name"] = preflight["step_d"].get("name", code_6)
@@ -708,7 +902,7 @@ def build_bridge(code, quick=False):
     bridge["_meta"]["SW3"] = preflight["step_d"].get("SW3", "未知")
     print(f"      SW1={preflight['step_d'].get('SW1')}  SSHY={preflight['step_d'].get('SSHY')}  L3={preflight['step_d'].get('L3_判定')}")
 
-    print(f"[5/5] 8季明细 (hermes_finance.py) ...")
+    print(f"[6/7] 8季明细 (hermes_finance.py) ...")
     bridge["quarterly"] = step_f_quarterly(code_6)
     print(f"      季度数: {len(bridge['quarterly'].get('quarters', []))}")
 
@@ -718,6 +912,13 @@ def build_bridge(code, quick=False):
     if q_nonrec is not None:
         preflight["step_c"]["financials"]["nonrec_pct"] = q_nonrec
         preflight["step_c"]["financials"]["nonrec_detail"] = q_nonrec_detail
+
+    print(f"[7/7] Bull vs Bear 辩论 ...")
+    preflight["step_g"] = step_g_debate(bridge)
+    if preflight["step_g"]["executed"]:
+        print(f"      多方={len(preflight['step_g']['bull_args'])}轮 空方={len(preflight['step_g']['bear_args'])}轮")
+    else:
+        print(f"      跳过 ({preflight['step_g'].get('error','?')})")
 
     # 保存
     out_path = os.path.join(DESKTOP, f"{code_6}_data_bridge.json")

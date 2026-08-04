@@ -201,6 +201,23 @@ def analyze_technicals(sina_symbol: str):
     ma30_slope = compute_slope(ma30, 5)
     dev_ma20 = round((last_close - last_ma20) / last_ma20 * 100, 2) if last_ma20 else None
 
+    # 暴跌日检测: 当日跌幅 > ATR 或 偏离MA20超10%
+    daily_chg = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if len(closes) >= 2 else 0
+    atr_pct_val = round(atr14 / last_close * 100, 2) if atr14 and last_close else 0
+    is_crash_day = abs(daily_chg) > atr_pct_val if atr_pct_val else False
+    is_crash_day = is_crash_day or (dev_ma20 is not None and abs(dev_ma20) > 10)
+
+    # 坑1/2修复: 暴跌日MA斜率被当日极端价格扭曲
+    # 用前一日MA序列重算"稳定斜率"(排除当日暴跌影响)
+    if is_crash_day and len(ma20) >= 7 and len(ma30) >= 7:
+        stable_ma20_slope = compute_slope(ma20[:-1], 5)  # 排除今日, 用昨天及之前的MA20
+        stable_ma30_slope = compute_slope(ma30[:-1], 5)
+        crash_marker = f"[暴跌修正] 原始={ma20_slope}%, 稳定={stable_ma20_slope}%"
+    else:
+        stable_ma20_slope = ma20_slope
+        stable_ma30_slope = ma30_slope
+        crash_marker = None
+
     # 量比（近20日 vs 前20日）
     vols = [int(float(b["volume"])) for b in daily_bars]
     if len(vols) >= 40:
@@ -222,13 +239,15 @@ def analyze_technicals(sina_symbol: str):
     else:
         alignment = "unknown"
 
-    # 趋势判定
-    if ma20_slope is not None:
-        if ma20_slope < -0.5 and (ma30_slope or 0) < 0:
+    # 趋势判定 (使用稳定斜率)
+    slope_for_trend = stable_ma20_slope if stable_ma20_slope is not None else ma20_slope
+    ms_for_trend = stable_ma30_slope if stable_ma30_slope is not None else ma30_slope
+    if slope_for_trend is not None:
+        if slope_for_trend < -0.5 and (ms_for_trend or 0) < 0:
             trend = "真DOWN"
-        elif ma20_slope > 0.1 and (ma30_slope or 0) >= -0.1:
+        elif slope_for_trend > 0.1 and (ms_for_trend or 0) >= -0.1:
             trend = "上升"
-        elif abs(ma20_slope) < 0.5:
+        elif abs(slope_for_trend) < 0.5:
             trend = "震荡"
         else:
             trend = "偏弱"
@@ -239,8 +258,8 @@ def analyze_technicals(sina_symbol: str):
         "date": daily_bars[-1]["day"],
         "close": last_close,
         "MA20": last_ma20, "MA30": last_ma30, "MA60": last_ma60,
-        "MA20_slope_pct": ma20_slope,
-        "MA30_direction": "UP" if (ma30_slope or 0) > 0 else "DOWN",
+        "MA20_slope_pct": stable_ma20_slope,
+        "MA30_direction": "UP" if (stable_ma30_slope or 0) > 0 else "DOWN",
         "deviation_from_MA20_pct": dev_ma20,
         "ATR14": atr14,
         "ATR_pct": round(atr14 / last_close * 100, 2) if atr14 and last_close else None,
@@ -248,7 +267,8 @@ def analyze_technicals(sina_symbol: str):
         "chg_5d_pct": chg_5d,
         "chg_20d_pct": chg_20d,
         "alignment": alignment,
-        "trend": trend
+        "trend": trend,
+        "crash_marker": crash_marker
     }
 
     # 周线（从日线聚合）
